@@ -6,7 +6,12 @@
 - ✅ Windows/Unix 両対応、プロンプト検知・割り込み送出対応
 - ✅ AIが扱いやすい **JSON API**（execute / input / get_output / stop など）
 
-任意コマンド実行を扱います。隔離環境（コンテナ/VM）推奨
+## Install / Requirements
+- Python 3.10+（Windows/Unix）
+- 文字化け時は `{"action":"set_encoding","data":{"encoding":"cp932"}}` か `utf-8` に切替
+
+## Safety Notes
+任意コマンドを扱うため **VM/コンテナ等の隔離環境推奨**。`fs_bridge/in`（入力）/`fs_bridge/out`（出力）は公開しないこと。
 
 ## Quick Start (FSブリッジ)
 ```bash
