@@ -47,6 +47,8 @@
 python interactive_cli_manager.py
 ```
 
+補足: 既定で子プロセスの入出力はマネージャーの標準エラー（stderr）へエコーされます。無効化する場合は `--no-echo-io` を付与してください。
+
 アプリケーションが起動すると、標準入力からのJSON形式のコマンドを待ち受け状態になります。AIエージェントは、このプロセスに対してJSON形式の文字列を送信することで、CLIツールの操作を開始できます。
 
 **注意点:**
@@ -140,10 +142,10 @@ python interactive_cli_manager.py
 - 特定のプロンプトやキーワードが出るまで待つ場合は`pattern`/`regex`を活用（`since`と併用で差分領域だけ検索）。
 
 【返却仕様の補足】
-- `include_index:true`を指定すると、累積出力に対するオフセット情報を返します。
-  - `index`: 取得時点の累積出力末尾位置（文字数）
-  - `start`: 今回の`output`の開始オフセット（`since`未指定時は0）
-- `since`を指定すると、`output`は未読バッファではなく累積出力の該当範囲（`start`以降）になります。
+- `include_index:true`でオフセット情報を返します（すべてグローバルオフセット）。
+  - `index`: プロセス開始からの累積出力の末尾位置（単調増加）。
+  - `start`: 今回の`output`の開始位置（グローバル）。
+- `since`は「グローバルオフセット」として扱われ、該当位置以降の出力を返します。出力上限（`set_output_limit`）により古い領域がトリム済みの場合、返却は保持範囲の先頭からとなり、`start`は保持先頭のグローバル位置に繰り上がります。
 - `wait:true`で待機し、`timeout`に達して新規出力が到達しなかった場合は`status:"timeout"`かつ通常は`output:""`を返します（同時到達があれば到達分のみ返る場合があります）。
 
 ### 出力ダンプ/クリア (`dump_output`, `clear_output`)
@@ -161,6 +163,21 @@ python interactive_cli_manager.py
 - ログの継続取得には、初回`dump_output`の`index`を保存→以後`since`で差分だけ取得。
 - エラー時の全文収集は`dump_output`（サイズ制限なし）。
 - セッション切替や解析リセット時は`clear_output(all:true)`。
+
+【補足（グローバルオフセット/ローテーション）】
+- `dump_output.index`/`start`はグローバルオフセットです。`set_output_limit`で先頭をトリムしても`index`は単調増加します。
+- `clear_output(all:true)`は履歴とオフセットを初期化します（以後の`index`は0から再カウント）。
+
+### 出力上限の設定 (`set_output_limit`)
+
+累積出力の保持上限を設定します。上限を超えた場合は先頭からトリムし、最新部分のみ保持します。
+
+```json
+{"action":"set_output_limit","data":{"max_chars": 50000}}
+```
+
+- `max_chars`: 0で無制限、正の整数で末尾保持サイズ（文字数）。
+- トリム後も`get_output`/`dump_output`の`index`はグローバルに単調増加します。`since`はグローバル指定で、範囲外は保持先頭に繰り上げます。
 
 ### エンコーディングの変更 (`set_encoding`)
 
@@ -614,6 +631,20 @@ CLIツールの応答が遅延したり、予期せぬフリーズが発生し�
 
 ### 5. セキュリティの考慮
  
+### PowerShellの引用・変数展開の注意（重要）
+
+PowerShellの `-Command` に渡す文字列は、JSON内のエスケープ→呼び出し元シェルの展開→PowerShellのパースという多層解釈が重なるため、引用崩れや意図しない変数展開（`$var`）でパーサーエラーが発生しやすいです。
+
+【推奨】
+- `command`はできる限り配列で渡す（例: `["powershell","-NoProfile","-Command","..."]`）。
+- 複雑な内容は `-File` で `.ps1` を実行（引用事故を避けやすい）。
+- `-Command`で文字列を直書きする場合は、PowerShell側はシングルクォートで包み、内部のシングルクォートは `''` で二重化。JSON内では `\"` でダブルクォートをエスケープ。
+- 変数リテラルをそのまま渡したいときは、バッククォートで逃す（例: `` `$x ``）。
+- FSブリッジでは、JSONはプログラム的に生成し（一時ファイル→リネーム投入推奨）、手打ちの多重エスケープを避ける。
+
+【代替例】
+- 対話確認や簡易エコーは `cmd /c`（`set /p` や `echo`）で行うと引用が単純になります。
+
 ## 返却スキーマ（共通仕様）
 
 - 共通フィールド:
@@ -623,9 +654,10 @@ CLIツールの応答が遅延したり、予期せぬフリーズが発生し�
 - アクション別フィールド（代表）:
   - `execute`: 成功時 `message`。`wait_for:"exited"`指定時は `{status:"success", message, final_status:"exited", return_code}` を同梱
   - `input`: 成功時 `message`。`wait_for_output`指定時は `output`
-  - `get_output`: `output`（文字列）。`wait`タイムアウト時は `status:"timeout"`＋`output:""`。`pattern`利用時は `matched`（bool）, `match_index`（一致先頭のオフセット、`include_index`と独立）を返す
-  - `dump_output`: `output`、`index`（累積末尾位置）、`start`（返却開始位置）
+  - `get_output`: `output`（文字列）。`wait`タイムアウト時は `status:"timeout"`＋`output:""`。`pattern`利用時は `matched`（bool）, `match_index`（一致先頭のオフセット、`include_index`と独立）を返す。`include_index:true`時の`index`/`start`はグローバルオフセット。
+  - `dump_output`: `output`、`index`（累積末尾のグローバル位置）、`start`（返却開始のグローバル位置）
   - `clear_output`: 成功時 `message`
+  - `set_output_limit`: 成功時 `message`（`max_chars=0`で無制限）。
   - `get_status`: `running`→`pid`、`exited`→`return_code`
   - `wait_status`: `exited`/`timeout`
   - `stop`/`graceful_stop`: 成功時 `message`

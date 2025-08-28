@@ -10,6 +10,7 @@ import io
 import time
 import signal
 import argparse
+import errno
 
 class InteractiveCLIManager:
     def __init__(self):
@@ -18,6 +19,9 @@ class InteractiveCLIManager:
         self.output_lock = threading.Lock()
         self.output_cv = threading.Condition(self.output_lock)
         self.output_full_buffer = []
+        self.output_full_offset = 0  # 累積出力のトリム済み先頭位置（グローバルインデックス）
+        self.output_max_chars = None  # None/0: 無制限、>0: 上限（先頭をトリム）
+        self.echo_io = True  # 標準は子プロセスの入出力をstderrへミラー
         # システムのデフォルトエンコーディングを使用。エラーは置き換えで処理。
         self.encoding = locale.getpreferredencoding(False)
         self._stdout_text = None
@@ -30,6 +34,7 @@ class InteractiveCLIManager:
         stream = self._stdout_text
         if stream is None:
             return
+        echo_buf = []
         while True:
             ch = stream.read(1)
             if ch == '' or ch is None:
@@ -37,7 +42,31 @@ class InteractiveCLIManager:
             with self.output_lock:
                 self.output_buffer.append(ch)
                 self.output_full_buffer.append(ch)
+                # 出力のローテーション（上限超過時は先頭をトリム）
+                if self.output_max_chars and self.output_max_chars > 0:
+                    extra = len(self.output_full_buffer) - int(self.output_max_chars)
+                    if extra > 0:
+                        # 先頭からextra文字を捨てる
+                        del self.output_full_buffer[:extra]
+                        self.output_full_offset += extra
                 self.output_cv.notify_all()
+            # echo
+            if self.echo_io:
+                echo_buf.append(ch)
+                if ch == '\n' or len(echo_buf) >= 512:
+                    try:
+                        sys.stderr.write(''.join(echo_buf))
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    echo_buf = []
+        # flush remaining echo buffer
+        if self.echo_io and echo_buf:
+            try:
+                sys.stderr.write(''.join(echo_buf))
+                sys.stderr.flush()
+            except Exception:
+                pass
 
     def execute_command(self, command, shell=False, env=None, tui=False):
         if self.process:
@@ -85,6 +114,20 @@ class InteractiveCLIManager:
             self.output_thread = threading.Thread(target=self._read_output)
             self.output_thread.daemon = True
             self.output_thread.start()
+            # Echo: EXEC line
+            if self.echo_io:
+                try:
+                    if isinstance(command, (list, tuple)):
+                        if sys.platform == "win32":
+                            cmdline = subprocess.list2cmdline([str(x) for x in command])
+                        else:
+                            cmdline = " ".join(shlex.quote(str(x)) for x in command)
+                    else:
+                        cmdline = str(command)
+                    sys.stderr.write(f"EXEC: {cmdline}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
             return {"status": "success", "message": "Command started."}
         except Exception as e:
             code = getattr(e, "errno", None)
@@ -100,10 +143,20 @@ class InteractiveCLIManager:
             # システムのデフォルトエンコーディングでエンコード
             self.process.stdin.write((input_text + os.linesep).encode(self.encoding))
             self.process.stdin.flush()
+            if self.echo_io:
+                try:
+                    sys.stderr.write(f">> {input_text}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
             return {"status": "success", "message": "Input sent."}
         except BrokenPipeError:
             return {"status": "error", "error_code": "BROKEN_PIPE", "message": "BrokenPipeError: The pipe has been closed. The command might have exited."}
         except Exception as e:
+            # 一部の環境では終了後の書き込みが OSError(Errno 22/9) などで返る
+            if isinstance(e, OSError):
+                if getattr(e, 'errno', None) in (errno.EINVAL, errno.EBADF, 22, 9):
+                    return {"status": "error", "error_code": "BROKEN_PIPE", "message": str(e)}
             return {"status": "error", "error_code": "INPUT_ERROR", "message": str(e)}
 
     def get_output(self, peek=False, wait=False, timeout=None, pattern=None, regex=False, since=None, include_index=False):
@@ -119,20 +172,27 @@ class InteractiveCLIManager:
             # パターン待機（出力全体から検索）
             matched = None
             match_index = None
-            start = 0
+            # sinceはグローバルインデックスとして扱う（トリム前提）
+            start_global = 0
             if since is not None and isinstance(since, int) and since >= 0:
-                start = min(since, len(full))
-            search_base = full[start:]
+                start_global = since
+            # ローカルバッファ内の開始位置
+            start_local = 0
+            if start_global > self.output_full_offset:
+                start_local = min(len(full), start_global - self.output_full_offset)
+            else:
+                start_local = 0
+            search_base = full[start_local:]
             if pattern:
                 import re
                 if regex:
                     m = re.search(pattern, search_base)
                     matched = m is not None
-                    match_index = (start + m.start()) if m else None
+                    match_index = (self.output_full_offset + start_local + m.start()) if m else None
                 else:
                     idx = search_base.find(pattern)
                     matched = idx != -1
-                    match_index = (start + idx) if matched else None
+                    match_index = (self.output_full_offset + start_local + idx) if matched else None
                 # waitループ（必要なら）
                 if wait and not matched and (self.process and self.process.poll() is None):
                     end = None if timeout is None else (time.time() + float(timeout))
@@ -142,15 +202,20 @@ class InteractiveCLIManager:
                             break
                         self.output_cv.wait(timeout=0.05 if remaining is None else min(0.05, max(0, remaining)))
                         full = "".join(self.output_full_buffer)
-                        search_base = full[start:]
+                        # 再計算
+                        if start_global > self.output_full_offset:
+                            start_local = min(len(full), start_global - self.output_full_offset)
+                        else:
+                            start_local = 0
+                        search_base = full[start_local:]
                         if regex:
                             m = re.search(pattern, search_base)
                             matched = m is not None
-                            match_index = (start + m.start()) if m else None
+                            match_index = (self.output_full_offset + start_local + m.start()) if m else None
                         else:
                             idx = search_base.find(pattern)
                             matched = idx != -1
-                            match_index = (start + idx) if matched else None
+                            match_index = (self.output_full_offset + start_local + idx) if matched else None
                         if matched:
                             break
                     if not matched:
@@ -158,13 +223,18 @@ class InteractiveCLIManager:
             # 通常の取得（since指定時はfullから返す）
             resp_output = output
             if since is not None:
-                resp_output = full[start:]
+                resp_output = full[start_local:]
             if not peek and since is None:
                 self.output_buffer = []
             resp = {"status": "success", "output": resp_output}
             if include_index:
-                resp["index"] = len(full)
-                resp["start"] = start
+                resp["index"] = self.output_full_offset + len(full)
+                # 取得開始位置（グローバル）
+                if since is not None:
+                    resp["start"] = max(self.output_full_offset, start_global)
+                else:
+                    # 未読バッファの開始推定
+                    resp["start"] = self.output_full_offset + max(0, len(full) - len(resp_output))
             if pattern:
                 resp["matched"] = bool(matched)
                 if match_index is not None:
@@ -235,9 +305,33 @@ class InteractiveCLIManager:
             except Exception as e:
                 return {"status": "error", "message": f"Error stopping command: {str(e)}"}
             finally:
+                # 入出力ストリームを明示的にクローズ（BufferedWriterのGC時例外を抑止）
+                try:
+                    if self.process is not None and getattr(self.process, "stdin", None):
+                        try:
+                            self.process.stdin.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    if self.process is not None and getattr(self.process, "stdout", None):
+                        try:
+                            self.process.stdout.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 try:
                     if self._stdout_text is not None:
                         self._stdout_text.close()
+                except Exception:
+                    pass
+                # 読み取りスレッドを短時間待機（安全に終了させる）
+                try:
+                    t = getattr(self, "output_thread", None)
+                    if t is not None:
+                        t.join(timeout=0.2)
                 except Exception:
                     pass
                 # PTY master fdを閉じる
@@ -276,9 +370,33 @@ class InteractiveCLIManager:
                 except Exception:
                     self.process.terminate()
             self.process.wait(timeout=timeout)
+            # 入出力ストリームを明示的にクローズ
+            try:
+                if getattr(self.process, "stdin", None):
+                    try:
+                        self.process.stdin.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if getattr(self.process, "stdout", None):
+                    try:
+                        self.process.stdout.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             try:
                 if self._stdout_text is not None:
                     self._stdout_text.close()
+            except Exception:
+                pass
+            # 読み取りスレッドを短時間待機
+            try:
+                t = getattr(self, "output_thread", None)
+                if t is not None:
+                    t.join(timeout=0.2)
             except Exception:
                 pass
             self._stdout_text = None
@@ -333,9 +451,12 @@ def main():
                         help='Use filesystem bridge at given directory (creates in/out). If omitted, defaults to ./fs_bridge.')
     parser.add_argument('--fs-interval', dest='fs_interval', type=float, default=0.05,
                         help='Polling interval (seconds) for FS bridge (default: 0.05).')
+    parser.add_argument('--no-echo-io', dest='echo_io', action='store_false', default=True,
+                        help='Disable echoing child I/O to stderr (echo is enabled by default).')
     args = parser.parse_args()
 
     manager = InteractiveCLIManager()
+    manager.echo_io = bool(args.echo_io)
 
     def handle_request(request: dict):
         action = request.get("action")
@@ -474,23 +595,49 @@ def main():
             with manager.output_lock:
                 full = "".join(manager.output_full_buffer)
                 total_len = len(full)
-                start = 0
+                # グローバルの開始オフセット
+                start_local = 0
                 if isinstance(since, int) and since >= 0:
-                    start = min(since, total_len)
+                    if since > manager.output_full_offset:
+                        start_local = min(total_len, since - manager.output_full_offset)
+                    else:
+                        start_local = 0
                 elif isinstance(tail, int) and tail >= 0:
-                    start = max(0, total_len - tail)
-                out = full[start:]
+                    start_local = max(0, total_len - tail)
+                out = full[start_local:]
                 response = {"status": "success", "output": out}
                 if include_index:
-                    response["index"] = total_len
-                    response["start"] = start
+                    response["index"] = manager.output_full_offset + total_len
+                    response["start"] = manager.output_full_offset + start_local
         elif action == "clear_output":
             clear_all = bool(data.get("all", False)) if isinstance(data, dict) else False
             with manager.output_lock:
                 manager.output_buffer = []
                 if clear_all:
                     manager.output_full_buffer = []
+                    manager.output_full_offset = 0
             response = {"status": "success", "message": "Output cleared."}
+        elif action == "set_output_limit":
+            max_chars = None
+            if isinstance(data, dict):
+                max_chars = data.get("max_chars")
+            if max_chars is None or (isinstance(max_chars, int) and max_chars < 0):
+                response = {"status": "error", "error_code": "BAD_REQUEST", "message": "max_chars (>=0) is required"}
+            else:
+                try:
+                    v = int(max_chars)
+                except Exception:
+                    response = {"status": "error", "error_code": "BAD_REQUEST", "message": "max_chars must be integer"}
+                else:
+                    manager.output_max_chars = None if v == 0 else v
+                    # すぐに適用
+                    with manager.output_lock:
+                        if manager.output_max_chars and manager.output_max_chars > 0:
+                            extra = len(manager.output_full_buffer) - int(manager.output_max_chars)
+                            if extra > 0:
+                                del manager.output_full_buffer[:extra]
+                                manager.output_full_offset += extra
+                    response = {"status": "success", "message": f"Output limit set to {v}. 0 means unlimited."}
         elif action == "close_stdin":
             if manager.process and manager.process.stdin:
                 try:
